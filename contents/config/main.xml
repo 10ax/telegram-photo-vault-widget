@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="pollIntervalSeconds" type="Int">
+      <label>Seconds between status checks.</label>
+      <default>30</default>
+    </entry>
+    <entry name="actionsEnabled" type="Bool">
+      <label>Show the service controls (start, stop, restart, run now).</label>
+      <default>true</default>
+    </entry>
+    <entry name="confirmStop" type="Bool">
+      <label>Ask for a second click before stopping the service.</label>
+      <default>true</default>
+    </entry>
+    <entry name="showTrayText" type="Bool">
+      <label>Show the pending upload count next to the tray icon.</label>
+      <default>false</default>
+    </entry>
+    <entry name="trayIndicator" type="String">
+      <label>How the tray icon carries the state: "state-dot", "icon-swap" or "none".</label>
+      <default>state-dot</default>
+    </entry>
+    <entry name="showUploadsRow" type="Bool">
+      <label>Show the uploads row (pending, in progress, failed).</label>
+      <default>true</default>
+    </entry>
+    <entry name="showWorkerRow" type="Bool">
+      <label>Show the worker row (running, next run, last error).</label>
+      <default>true</default>
+    </entry>
+    <entry name="showRecoveryRow" type="Bool">
+      <label>Show the recovery row (tidy state and last batch).</label>
+      <default>true</default>
+    </entry>
+    <entry name="showDiskRow" type="Bool">
+      <label>Show the disk row (free space and the download floor).</label>
+      <default>true</default>
+    </entry>
+    <entry name="showFooter" type="Bool">
+      <label>Show the footer with the last update time and the next check countdown.</label>
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>

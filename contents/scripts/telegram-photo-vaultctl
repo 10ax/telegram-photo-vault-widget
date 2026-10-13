@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+#
+# telegram-photo-vaultctl — status and control for the telegram-photo-vault
+# systemd --user service and the HTTP API it serves.
+#
+# The plasmoid calls this through Plasma's `executable` data source:
+#
+#   json      Print the widget's whole state as one line of JSON. Always exits 0,
+#             including for errors ({"ok":false,"error":"…"}), so the QML side
+#             only ever has to JSON.parse() and never deals with a shell failure.
+#   start     Start the service.
+#   stop      Stop the service.
+#   restart   Restart the service (used after a code or .env change).
+#   toggle    Stop when running, start when stopped.
+#   run       Ask the running service for an immediate worker run (POST /api/run).
+#   status    Human-readable summary (same data as `json`).
+#   doctor    Dependency, unit and live-API health report.
+#   logs      Follow the service journal.
+#
+# The status JSON names its own source, because it is assembled from three
+# places with different availability:
+#
+#   systemctl --user show   service state. Works even while the service is
+#                           stopped, which is the point: the pending count must
+#                           not disappear just because the API is down.
+#   GET /api/status         worker/recovery/disk detail and the counts. Only
+#   GET /api/system         answers while the service is up. "source":"api".
+#   sqlite3, read-only      the same counts straight from the database when the
+#                           API cannot be reached. "source":"db".
+#
+# The API key is read from the repo's .env and never printed.
+#
+# Environment overrides (all optional):
+#   TPV_HOME=/path/to/telegram-photo-vault   repo directory
+#   TPV_UNIT=telegram-photo-vault.service    systemd user unit
+#   TPV_PORT=8100                            API port
+#   TPV_HTTP_TIMEOUT=4                       curl timeout, seconds
+#   TPV_ENV_FILE=/path/to/.env               where API_KEY lives
+#   TPV_DB=/path/to/telegram_photo_vault.db  database used for the fallback
+#   TPV_API_KEY=…                            skip .env and use this key
+#
+set -euo pipefail
+
+unit_name="${TPV_UNIT:-telegram-photo-vault.service}"
+repo_dir="${TPV_HOME:-$HOME/Personal/code/telegram-photo-vault}"
+port="${TPV_PORT:-8100}"
+http_timeout="${TPV_HTTP_TIMEOUT:-4}"
+env_file="${TPV_ENV_FILE:-$repo_dir/.env}"
+db_path="${TPV_DB:-$repo_dir/local-data/telegram_photo_vault.db}"
+api_base="http://localhost:$port"
+
+# Pipeline stages in display order. The helper always reports all of them, with
+# zeros for the ones the service has never seen, so the popup's layout does not
+# move between a fresh install and a busy one.
+photo_stages="PENDING DOWNLOADED CHUNK_UPLOADING TG_UPLOADED COMPRESSED ODROID_UPLOADED COMPLETED FAILED SKIPPED"
+
+usage() {
+    cat <<'USAGE'
+Usage: telegram-photo-vaultctl <command>
+
+Commands:
+  json             Print the widget status as one line of JSON (default).
+  start|stop       Start or stop the telegram-photo-vault user service.
+  restart|toggle   Restart it, or stop it when running.
+  run              Trigger an immediate worker run through the API.
+  status           Print a human-readable summary.
+  doctor           Check dependencies, the unit, the key and one live API probe.
+  logs             Follow the service journal.
+
+Environment:
+  TPV_HOME=/path/to/telegram-photo-vault
+  TPV_UNIT=telegram-photo-vault.service
+  TPV_PORT=8100
+  TPV_HTTP_TIMEOUT=4
+  TPV_API_KEY=…    Use this key instead of reading API_KEY from the .env file.
+USAGE
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+json_error() {
+    printf '{"ok":false,"error":"%s"}\n' "$1"
+    exit 0
+}
+
+# Read API_KEY out of the env file without executing it. Quoted values and
+# stray whitespace are tolerated; the value is never echoed anywhere.
+api_key() {
+    if [ -n "${TPV_API_KEY:-}" ]; then
+        printf '%s' "$TPV_API_KEY"
+        return 0
+    fi
+    [ -r "$env_file" ] || return 1
+
+    local value
+    value=$(grep -m1 -E '^[[:space:]]*API_KEY=' "$env_file" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)
+    # Trim surrounding whitespace.
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    [ -n "$value" ] || return 1
+    printf '%s' "$value"
+}
+
+is_active() {
+    systemctl --user --quiet is-active "$unit_name" 2>/dev/null
+}
+
+# The service block, straight from systemd. ActiveState is the truth for
+# "is it working"; UnitFileState answers "will it come back at boot".
+service_json() {
+    [ -n "$(command -v systemctl || true)" ] || return 1
+
+    local load_state="" active_state="" unit_state="" started="" restarts=""
+    while IFS= read -r line; do
+        case "$line" in
+            LoadState=*) load_state="${line#LoadState=}" ;;
+            ActiveState=*) active_state="${line#ActiveState=}" ;;
+            UnitFileState=*) unit_state="${line#UnitFileState=}" ;;
+            ExecMainStartTimestamp=*) started="${line#ExecMainStartTimestamp=}" ;;
+            NRestarts=*) restarts="${line#NRestarts=}" ;;
+        esac
+    done < <(systemctl --user show "$unit_name" \
+                -p LoadState,ActiveState,UnitFileState,ExecMainStartTimestamp,NRestarts \
+                --no-pager 2>/dev/null || true)
+
+    # "Mon 2026-10-12 09:11:58 CEST" -> ISO 8601, which JavaScript parses.
+    local since=""
+    if [ -n "$started" ]; then
+        local stamp
+        stamp=$(printf '%s' "$started" | awk '{print $2 " " $3}')
+        since=$(date -d "$stamp" -Iseconds 2>/dev/null || true)
+    fi
+
+    jq -cn \
+        --arg state "${active_state:-unknown}" \
+        --arg unitState "${unit_state:-}" \
+        --arg since "$since" \
+        --argjson installed "$([ "$load_state" = "loaded" ] && printf true || printf false)" \
+        --argjson active "$([ "$active_state" = "active" ] && printf true || printf false)" \
+        --argjson enabled "$([ "$unit_state" = "enabled" ] && printf true || printf false)" \
+        --argjson restarts "${restarts:-0}" \
+        '{
+            installed: $installed,
+            active: $active,
+            state: $state,
+            enabled: $enabled,
+            unitFileState: $unitState,
+            since: (if $since == "" then null else $since end),
+            restarts: $restarts
+        }'
+}
+
+# Request a JSON endpoint, writing the body to $3 and printing the HTTP status
+# code ("000" when the request never reached the server). The status matters:
+# the API answers 401 and 503 with a perfectly parseable JSON error body, and
+# treating that as success would show an all-zero status instead of an error.
+# $4 is the HTTP method (default GET).
+api_fetch() {
+    local url="$1" key="$2" destination="$3" method="${4:-GET}" code
+    code=$(curl -sS --max-time "$http_timeout" --request "$method" \
+                -o "$destination" -w '%{http_code}' \
+                -H "X-Api-Key: $key" -H 'Accept: application/json' \
+                "$url" 2>/dev/null) || true
+    # curl prints the code even when it fails to connect, but be explicit.
+    [ -n "$code" ] || code="000"
+    printf '%s' "$code"
+}
+
+# Map a status code to the error code the widget knows how to explain.
+api_error_code() {
+    case "$1" in
+        401) printf 'unauthorized' ;;
+        503) printf 'not-configured' ;;
+        000) printf 'network' ;;
+        *) printf 'http-%s' "$1" ;;
+    esac
+}
+
+# Counts straight from SQLite, read-only with a short busy timeout: the service
+# writes to the same file (journal_mode=delete, so a reader can find it locked
+# for a moment). Never `immutable=1` — the database is live.
+sqlite_counts() {
+    local table="$1"
+    have sqlite3 || return 1
+    [ -r "$db_path" ] || return 1
+    # -readonly rather than a file: URI, and the CLI's default "|" separator
+    # (status names never contain one).
+    sqlite3 -readonly -cmd ".timeout 2000" "$db_path" \
+        "select status, count(*) from $table group by status;" 2>/dev/null
+}
+
+# Fold "STATUS|N" lines into a complete status map with zeros, so the QML side
+# never has to distinguish "missing" from "zero".
+status_map() {
+    local rows="${1:-}" stages="$2"
+    printf '%s\n' "$rows" | jq -Rsc --arg stages "$stages" '
+        ($stages | split(" ")) as $keys
+        | (split("\n")
+           | map(select(length > 0) | split("|") | select(length == 2))
+           | map({ (.[0]): (.[1] | tonumber? // 0) })
+           | add // {}) as $counts
+        | reduce $keys[] as $key ({}; .[$key] = ($counts[$key] // 0))'
+}
+
+# Disk usage of the data volume, for when the API cannot report it itself.
+disk_json() {
+    local target="$1"
+    have df || return 1
+    local line total used free
+    line=$(df --output=size,used,avail -B1 -- "$target" 2>/dev/null | tail -n 1) || return 1
+    read -r total used free <<<"$line"
+    case "$total$used$free" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    jq -cn --arg path "$target" --argjson total "$total" --argjson used "$used" --argjson free "$free" '
+        {
+            path: $path,
+            totalBytes: $total,
+            usedBytes: $used,
+            freeBytes: $free,
+            usedPercent: (if $total > 0 then (($used / $total) * 10000 | round) / 100 else 0 end)
+        }'
+}
+
+cmd_json() {
+    have jq || json_error "missing-jq"
+
+    local service
+    service=$(service_json) || service='{"installed":false,"active":false,"state":"unknown","enabled":false,"since":null,"restarts":0}'
+
+    local active
+    active=$(printf '%s' "$service" | jq -r '.active')
+
+    local source="db" error="" worker="null" recovery="null" system="null" photos="null" api=""
+
+    if [ "$active" = "true" ]; then
+        local key
+        key=$(api_key) || true
+        if [ -z "${key:-}" ]; then
+            error="no-api-key"
+        else
+            local tmp_status tmp_system
+            tmp_status=$(mktemp)
+            tmp_system=$(mktemp)
+            trap 'rm -f "${tmp_status:-}" "${tmp_system:-}"' EXIT
+
+            local code
+            code=$(api_fetch "$api_base/api/status" "$key" "$tmp_status")
+            if [ "$code" != "200" ]; then
+                error=$(api_error_code "$code")
+            else
+                api=$(cat "$tmp_status")
+                # A 200 whose body is not the status payload (a proxy error page,
+                # a renamed field) is still a failure: better an explained error
+                # than a confident row of zeros.
+                if ! printf '%s' "$api" | jq -e 'has("photos")' >/dev/null 2>&1; then
+                    api=""
+                    error="bad-response"
+                fi
+            fi
+
+            if [ -n "$api" ]; then
+                source="api"
+                photos=$(printf '%s' "$api" | jq -c '.photos // {}')
+                worker=$(printf '%s' "$api" | jq -c '
+                    .worker
+                    | if . == null then null else {
+                        running: (.running // false),
+                        mode: (.mode // ""),
+                        runIntervalSeconds: (.run_interval_seconds // null),
+                        lastRunStartedAt: (.last_run_started_at // null),
+                        lastRunFinishedAt: (.last_run_finished_at // null),
+                        nextRunAt: (.next_run_at // null),
+                        lastRunError: (.last_run_error // null)
+                      } end')
+                recovery=$(printf '%s' "$api" | jq -c '
+                    .recovery
+                    | if . == null then null else {
+                        running: (.running // false),
+                        activity: (.activity // null),
+                        batch: (.batch // null),
+                        items: (.items // {}),
+                        disk: (if .disk == null then null else {
+                            downloadRoot: (.disk.download_root // null),
+                            freeBytes: (.disk.free_bytes // null),
+                            minFreeBytes: (.disk.min_free_bytes // null),
+                            belowFloor: (.disk.below_floor // false)
+                        } end)
+                      } end')
+                # The disk block is best-effort: losing it must not lose the
+                # worker rows that came from the same successful fetch.
+                if [ "$(api_fetch "$api_base/api/system" "$key" "$tmp_system")" = "200" ] \
+                    && jq -e 'has("used_percent")' "$tmp_system" >/dev/null 2>&1; then
+                    system=$(jq -c '{
+                        path: (.path // ""),
+                        totalBytes: (.total_bytes // 0),
+                        usedBytes: (.used_bytes // 0),
+                        freeBytes: (.free_bytes // 0),
+                        usedPercent: (.used_percent // 0)
+                    }' "$tmp_system")
+                fi
+            fi
+        fi
+    fi
+
+    # Counts: the API's when it answered, the database's otherwise. This is the
+    # part that keeps working while the service is stopped.
+    if [ "$photos" = "null" ]; then
+        local rows
+        rows=$(sqlite_counts photos) || rows=""
+        if [ -z "$rows" ] && { ! have sqlite3 || [ ! -r "$db_path" ]; }; then
+            [ -n "$error" ] || error="no-db"
+        fi
+        photos=$(status_map "$rows" "$photo_stages")
+    fi
+
+    # Recovery item counts are on the same footing; the live run/activity/batch
+    # detail is only ever available from the API.
+    local recovery_items
+    recovery_items=$(printf '%s' "$recovery" | jq -c '.items // null' 2>/dev/null || printf 'null')
+    if [ "$recovery_items" = "null" ]; then
+        local rows
+        rows=$(sqlite_counts recovery_items) || rows=""
+        recovery_items=$(status_map "$rows" "SCANNED DOWNLOADED PLANNED REUPLOADED COMPLETED SKIPPED DUPLICATE FAILED")
+        if [ "$recovery" = "null" ]; then
+            recovery=$(jq -cn --argjson items "$recovery_items" \
+                '{running: null, activity: null, batch: null, items: $items, disk: null}')
+        else
+            recovery=$(printf '%s' "$recovery" | jq -c --argjson items "$recovery_items" '.items = $items')
+        fi
+    fi
+
+    if [ "$system" = "null" ]; then
+        local fallback_path="$repo_dir/local-data"
+        [ -d "$fallback_path" ] || fallback_path="$repo_dir"
+        system=$(disk_json "$fallback_path") || system="null"
+    fi
+
+    jq -cn \
+        --arg source "$source" \
+        --arg error "$error" \
+        --arg updatedAt "$(date -Iseconds)" \
+        --argjson service "$service" \
+        --argjson photos "$photos" \
+        --argjson worker "$worker" \
+        --argjson recovery "$recovery" \
+        --argjson system "$system" \
+        '{
+            ok: true,
+            source: $source,
+            error: $error,
+            updatedAt: $updatedAt,
+            service: $service,
+            photos: $photos,
+            worker: $worker,
+            recovery: $recovery,
+            system: $system
+        }'
+}
+
+action_service() {
+    local verb="$1"
+    have systemctl || { printf 'systemctl not found.\n' >&2; return 127; }
+
+    if [ "$verb" = "toggle" ]; then
+        if is_active; then verb="stop"; else verb="start"; fi
+    fi
+
+    # systemctl explains the failure on stderr; pass it through, because the
+    # popup shows it verbatim.
+    if ! systemctl --user "$verb" "$unit_name" 2>&1; then
+        printf 'Could not %s %s.\n' "$verb" "$unit_name" >&2
+        return 1
+    fi
+
+    case "$verb" in
+        start) printf 'Service started.\n' ;;
+        stop) printf 'Service stopped.\n' ;;
+        restart) printf 'Service restarted.\n' ;;
+        *) printf '%s done.\n' "$verb" ;;
+    esac
+}
+
+action_run() {
+    local key
+    key=$(api_key) || true
+    if [ -z "${key:-}" ]; then
+        printf 'No API_KEY in %s.\n' "$env_file" >&2
+        return 1
+    fi
+
+    local tmp code
+    tmp=$(mktemp)
+    trap 'rm -f "${tmp:-}"' EXIT
+
+    code=$(api_fetch "$api_base/api/run" "$key" "$tmp" POST)
+    case "$code" in
+        200) ;;
+        401) printf 'The vault rejected the API key (HTTP 401). Check API_KEY in %s.\n' "$env_file" >&2; return 1 ;;
+        503) printf 'The worker is not running, so no run can be started.\n' >&2; return 1 ;;
+        000) printf 'Cannot reach the vault API on port %s.\n' "$port" >&2; return 1 ;;
+        *) printf 'The vault refused the run request (HTTP %s).\n' "$code" >&2; return 1 ;;
+    esac
+
+    if ! jq -e '.triggered == true' "$tmp" >/dev/null 2>&1; then
+        printf 'The vault answered without starting a run.\n' >&2
+        return 1
+    fi
+    printf 'Run requested.\n'
+}
+
+cmd_status() {
+    local payload
+    payload=$(cmd_json)
+
+    printf '%s' "$payload" | jq -r '
+        def num($value): ($value // "?" | tostring);
+        def gb($bytes): if ($bytes // null) == null then "?" else (((($bytes / 1073741824) * 10) | round) / 10 | tostring) + " GB" end;
+
+        "service:  \(.service.state)" +
+            (if .service.enabled then " (enabled at boot)" else " (not enabled at boot)" end) +
+            (if .service.since then " since \(.service.since)" else "" end) +
+            (if (.service.restarts // 0) > 0 then " · \(.service.restarts) restart(s)" else "" end) +
+        "\nsource:   \(.source)" +
+            (if .error == "" then "" else " (\(.error))" end) +
+        "\nuploads:  \(num(.photos.PENDING)) pending · " +
+            "\(if .photos == null then "?" else num(.photos.DOWNLOADED + .photos.CHUNK_UPLOADING + .photos.TG_UPLOADED + .photos.COMPRESSED + .photos.ODROID_UPLOADED) end) in progress · " +
+            "\(num(.photos.FAILED)) failed · \(num(.photos.COMPLETED)) completed" +
+        "\nworker:   " + (if .worker == null then "unknown (service not running)" else
+            (if .worker.running then "running since \(.worker.lastRunStartedAt)" else "idle" end) +
+            " · next \(.worker.nextRunAt // "-")" end) +
+        "\nrecovery: " + (if .recovery == null then "unknown" else
+            ((if .recovery.running then (.recovery.activity // "running") else "idle" end) +
+             " · " + num(.recovery.items.COMPLETED) + " tidied, " + num(.recovery.items.SKIPPED) + " skipped") end) +
+        "\ndisk:     " + (if .system == null then "unknown" else
+            "\(gb(.system.freeBytes)) free of \(gb(.system.totalBytes)) (\(.system.usedPercent)%)" end)'
+}
+
+cmd_doctor() {
+    local failed=0
+
+    for command_name in jq curl sqlite3 systemctl; do
+        if have "$command_name"; then
+            printf 'ok:      %s -> %s\n' "$command_name" "$(command -v "$command_name")"
+        else
+            printf 'missing: %s\n' "$command_name"
+            [ "$command_name" = "sqlite3" ] || failed=1
+        fi
+    done
+
+    printf 'repo:    %s (%s)\n' "$repo_dir" "$([ -d "$repo_dir" ] && echo present || echo MISSING)"
+
+    local unit_state
+    unit_state=$(systemctl --user show "$unit_name" -p LoadState,ActiveState,UnitFileState --no-pager 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "$unit_state" ]; then
+        printf 'unit:    %s\n' "$unit_state"
+        case "$unit_state" in
+            *ActiveState=active*) printf 'unit:    active\n' ;;
+            *) printf 'unit:    not active — start it with: %s start\n' "$0"; failed=1 ;;
+        esac
+    else
+        printf 'unit:    MISSING — %s is not installed for this user\n' "$unit_name"
+        failed=1
+    fi
+
+    if [ -r "$env_file" ]; then
+        printf 'env:     %s (readable)\n' "$env_file"
+    else
+        printf 'env:     %s MISSING — API_KEY cannot be read\n' "$env_file"
+        failed=1
+    fi
+
+    local key
+    key=$(api_key) || true
+    if [ -n "${key:-}" ]; then
+        printf 'key:     present (length %s)\n' "${#key}"
+    else
+        printf 'key:     MISSING — set API_KEY in %s\n' "$env_file"
+        failed=1
+    fi
+
+    printf 'db:      %s (%s)\n' "$db_path" "$([ -r "$db_path" ] && echo readable || echo unreadable)"
+
+    if is_active; then
+        local code
+        code=$(curl -sS --max-time "$http_timeout" -o /dev/null -w '%{http_code}' \
+                    -H "X-Api-Key: ${key:-}" "$api_base/api/status" 2>/dev/null || printf '000')
+        if [ "$code" = "200" ]; then
+            printf 'api:     ok (HTTP %s)\n' "$code"
+            printf 'status:  %s\n' "$(cmd_json)"
+        else
+            printf 'api:     FAILED (HTTP %s on port %s)\n' "$code" "$port"
+            failed=1
+        fi
+    fi
+
+    [ "$failed" -eq 0 ] && printf 'result:  ok\n' || printf 'result:  problems found\n'
+    return 0
+}
+
+command_name="${1:-json}"
+
+case "$command_name" in
+    json)    cmd_json ;;
+    start|stop|restart|toggle) action_service "$command_name" ;;
+    run)     action_run ;;
+    status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+    logs)    journalctl --user -u "$unit_name" --follow --no-pager ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; json_error "unknown-command" ;;
+esac

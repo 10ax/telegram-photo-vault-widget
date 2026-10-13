@@ -1,0 +1,23 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "",
+                "Name": "Tenax"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Shows the telegram-photo-vault service state, pending uploads and worker activity in the system tray.",
+        "EnabledByDefault": true,
+        "Icon": "cloud-upload-symbolic",
+        "Id": "org.tenax.telegramphotovault",
+        "License": "MIT",
+        "Name": "Telegram Photo Vault",
+        "Version": "0.1.0",
+        "Website": "http://localhost:8100/"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": true,
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}
