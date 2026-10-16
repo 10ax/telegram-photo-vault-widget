@@ -1,0 +1,22 @@
+# Lint the shell this repo owns, through 10ax/ci-common (tag v1, shell.yml).
+# Warnings, not gates: a red run signals, nothing blocks a push.
+# -S warning: info-level style notes are not the gate.
+name: lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    uses: 10ax/ci-common/.github/workflows/shell.yml@v1
+    with:
+      shellcheck-targets: "-S warning dev.sh"
